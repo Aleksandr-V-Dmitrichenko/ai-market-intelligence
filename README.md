@@ -10,7 +10,11 @@
 2. **Lead Qualifier & Scorer (`/classify`)**
    * Обрабатывает входящие обращения клиентов.
    * Распознает имя, контакты, намерение (PURCHASE, QUESTION, SPAM, COMPLAINT), бюджет и рассчитывает `lead_score`.
-
+3. **AI Knowledge Base / RAG (`/add_documents`, `/upload_file`, `/query`)**
+   * Корпоративная база знаний с векторным поиском (**ChromaDB**).
+   * Принимает документы (PDF, DOCX, TXT), автоматически нарезает их на смысловые чанки и сохраняет эмбеддинги.
+   * Отвечает на вопросы сотрудников строго по внутренним регламентам компании без галлюцинаций.
+   
 ## Технологический стек
 
 * **Python 3.11+**
@@ -27,7 +31,7 @@
    cd ai-market-intelligence
 2. **Установите зависимости:**
    ```bash
-   pip install fastapi uvicorn mistralai python-dotenv pydantic
+    pip install fastapi uvicorn mistralai python-dotenv pydantic chromadb pypdf python-docx
 3. **Настройте переменные окружения:**
 
    Создайте файл .env в корне проекта:
