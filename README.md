@@ -29,9 +29,13 @@
    ```bash
    pip install fastapi uvicorn mistralai python-dotenv pydantic
 3. **Настройте переменные окружения:**
+
    Создайте файл .env в корне проекта:
+   
    MISTRAL_API_KEY=your_mistral_api_key_here
-4. **Запустите сервер:**
+5. **Запустите сервер:**
+   ```bash
    uvicorn main:app --reload
-5. **Откройте интерактивную документацию Swagger UI:**
+6. **Откройте интерактивную документацию Swagger UI:**
+   
    http://127.0.0.1:8000/docs
