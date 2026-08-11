@@ -1,0 +1,17 @@
+# Секретные ключи и переменные окружения
+.env
+*.env
+
+# Кэш Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Настройки VS Code / macOS
+.vscode/
+.DS_Store
