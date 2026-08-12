@@ -1,8 +1,11 @@
+import io
 import os
 import chromadb
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, HTTPException
+from docx import Document as DocxDocument
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from mistralai import Mistral
+from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 # 1. Загружаем переменные окружения (.env)
@@ -10,97 +13,135 @@ load_dotenv(find_dotenv())
 
 app = FastAPI(title="AI Knowledge Base (RAG) Microservice")
 
-# 2. Инициализируем клиенты Mistral и ChromaDB
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 client = Mistral(api_key=MISTRAL_API_KEY)
 
-# ChromaDB будет сохранять данные локально в папку ./chroma_db
+# ChromaDB сохраняет векторы в папку ./chroma_db
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection(
-    name="company_rules"
-)
+collection = chroma_client.get_or_create_collection(name="company_rules")
 
 
-# 3. Pydantic-схемы
-class DocumentInput(BaseModel):
-    documents: list[str] = Field(
-        description="Список текстов/регламентов компании для загрузки в базу знаний",
-        examples=[
-            [
-                "График работы офиса: с 9:00 до 18:00 с понедельника по пятницу.",
-                "Оплата задержек: сверхурочные оплачиваются по коэффициенту 1.5.",
-            ]
-        ],
-    )
+# Вспомогательные функции для парсинга и чанкинга
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Извлекает сырой текст из PDF, DOCX или TXT файлов."""
+    ext = filename.split(".")[-1].lower()
+    text = ""
+
+    if ext == "pdf":
+        pdf = PdfReader(io.BytesIO(file_bytes))
+        for page in pdf.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
+
+    elif ext in ["docx", "doc"]:
+        doc = DocxDocument(io.BytesIO(file_bytes))
+        for paragraph in doc.paragraphs:
+            if paragraph.text:
+                text += paragraph.text + "\n"
+
+    elif ext == "txt":
+        text = file_bytes.decode("utf-8", errors="ignore")
+
+    else:
+        raise ValueError(
+            f"Неподдерживаемый формат файла: {ext}. Допустимы PDF, DOCX, TXT."
+        )
+
+    return text.strip()
 
 
+def chunk_text(
+    text: str, chunk_size: int = 500, overlap: int = 100
+) -> list[str]:
+    """
+    Режет большой текст на чанки фиксированного размера с перекрытием (overlap).
+    """
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk.strip())
+        start += chunk_size - overlap
+    return [c for c in chunks if c]
+
+
+# Pydantic-схемы
 class QueryInput(BaseModel):
     question: str = Field(
-        description="Вопрос пользователя",
+        description="Вопрос пользователя к базе знаний",
         examples=["Как оплачиваются переработки в компании?"],
     )
 
 
 class QueryResponse(BaseModel):
-    answer: str = Field(
-        description="Сгенерированный ответ нейросети на основе найденного контекста"
-    )
+    answer: str = Field(description="Сгенерированный ответ нейросети")
     found_context: list[str] = Field(
-        description="Найденные релевантные фрагменты из векторной базы знаний"
+        description="Найденные релевантные фрагменты"
     )
 
 
-# 4. Эндпоинт загрузки документов в векторную БД
-@app.post("/add_documents")
-async def add_documents(data: DocumentInput):
+# Эндпоинт 1: Загрузка файлов (PDF, DOCX, TXT)
+@app.post("/upload_file")
+async def upload_file(file: UploadFile = File(...)):
     try:
-        if not data.documents:
+        content = await file.read()
+
+        # 1. Извлекаем сырой текст из файла
+        raw_text = extract_text_from_file(content, file.filename)
+        if not raw_text:
             raise HTTPException(
-                status_code=400, detail="Список документов пуст"
+                status_code=400, detail="Файл пуст или не содержит текста"
             )
 
-        # Генерируем уникальные ID для каждого фрагмента
-        existing_count = collection.count()
-        ids = [f"doc_{existing_count + i}" for i in range(len(data.documents))]
+        # 2. Нарезаем текст на чанки по 500 символов с перекрытием 100
+        chunks = chunk_text(raw_text, chunk_size=500, overlap=100)
 
-        # ChromaDB автоматически превратит тексты в векторы (эмбеддинги) и сохранит их
-        collection.add(documents=data.documents, ids=ids)
+        # 3. Генерируем уникальные ID и добавляем в ChromaDB
+        existing_count = collection.count()
+        ids = [f"file_doc_{existing_count + i}" for i in range(len(chunks))]
+
+        collection.add(documents=chunks, ids=ids)
 
         return {
             "status": "success",
-            "message": f"Успешно добавлено документов: {len(data.documents)}",
+            "filename": file.filename,
+            "extracted_text_length": len(raw_text),
+            "created_chunks_count": len(chunks),
             "total_documents_in_db": collection.count(),
         }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 5. Эндпоинт RAG-поиска и ответа на вопрос
+# Эндпоинт 2: Вопрос к базе знаний
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(data: QueryInput):
     try:
-        # Шаг 1: Ищем 2 самых похожих по смыслу куска текста в ChromaDB
         results = collection.query(query_texts=[data.question], n_results=2)
-
         retrieved_docs = (
             results["documents"][0] if results.get("documents") else []
         )
 
-        if not retrieved_docs:
-            context_str = "Контекст отсутствует."
-        else:
-            context_str = "\n---\n".join(retrieved_docs)
+        context_str = (
+            "\n---\n".join(retrievedsra_docs)
+            if retrieved_docs
+            else "Контекст отсутствует."
+        )
 
-        # Шаг 2: Формируем строгий системный промпт с найденным контекстом
         prompt = f"""
 Ты — AI-ассистент базы знаний компании.
 Твоя задача — ответить на вопрос пользователя, опираясь НА КОНТЕКСТ ниже.
 
 ПРАВИЛА:
-1. Используй информацию из контекста и делай из нее прямые логические выводы (например: "прием заявок за 14 дней" означает, что подать заявление нужно минимум за 14 дней).
+1. Используй информацию из контекста и делай из нее прямые логические выводы.
 2. Не придумывай факты, которых нет в контексте.
-3. Если контекст вообще не содержит информации по теме вопроса, ответь: "К сожалению, в базе знаний нет информации по этому вопросу."
+3. Если контекст не содержит информации, ответь: "К сожалению, в базе знаний нет информации по этому вопросу."
 
 КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ:
 {context_str}
@@ -109,16 +150,14 @@ async def query_knowledge_base(data: QueryInput):
 {data.question}
 """
 
-        # Шаг 3: Отправляем контекст + вопрос в Mistral
         response = client.chat.complete(
             model="mistral-small-latest",
             messages=[{"role": "user", "content": prompt}],
         )
 
-        answer_text = response.choices[0].message.content
-
         return QueryResponse(
-            answer=answer_text, found_context=retrieved_docs
+            answer=response.choices[0].message.content,
+            found_context=retrieved_docs,
         )
 
     except Exception as e:
