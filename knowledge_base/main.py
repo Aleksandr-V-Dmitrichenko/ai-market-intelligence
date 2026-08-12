@@ -1,6 +1,7 @@
 import io
 import os
 import chromadb
+from chromadb.utils import embedding_functions
 from dotenv import find_dotenv, load_dotenv
 from docx import Document as DocxDocument
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -17,9 +18,20 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 client = Mistral(api_key=MISTRAL_API_KEY)
 
+# Создаем функцию эмбеддинга на базе мультиязычной модели
+multilingual_ef = (
+    embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    )
+)
+
 # ChromaDB сохраняет векторы в папку ./chroma_db
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection(name="company_rules")
+# Передаем функцию в коллекцию
+collection = chroma_client.get_or_create_collection(
+    name="company_rules_v2",
+    embedding_function=multilingual_ef,
+)
 
 
 # Вспомогательные функции для парсинга и чанкинга
@@ -123,13 +135,13 @@ async def upload_file(file: UploadFile = File(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(data: QueryInput):
     try:
-        results = collection.query(query_texts=[data.question], n_results=2)
+        results = collection.query(query_texts=[data.question], n_results=5)
         retrieved_docs = (
             results["documents"][0] if results.get("documents") else []
         )
 
         context_str = (
-            "\n---\n".join(retrievedsra_docs)
+            "\n---\n".join(retrieved_docs)
             if retrieved_docs
             else "Контекст отсутствует."
         )
