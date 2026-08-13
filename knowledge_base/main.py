@@ -8,6 +8,7 @@ from dotenv import find_dotenv, load_dotenv
 from docx import Document as DocxDocument
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from mistralai import Mistral
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
@@ -36,6 +37,12 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=multilingual_ef,
 )
 
+# Настраиваем уманый рекусривный чанкер
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
 
 # Вспомогательные функции для парсинга и чанкинга
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
@@ -67,20 +74,9 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     return text.strip()
 
 
-def chunk_text(
-    text: str, chunk_size: int = 500, overlap: int = 100
-) -> list[str]:
-    """
-    Режет большой текст на чанки фиксированного размера с перекрытием (overlap).
-    """
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk.strip())
-        start += chunk_size - overlap
-    return [c for c in chunks if c]
+def chunk_text_recursively(text: str) -> list[str]:
+    """Умная каскадная нарезка текста по абзацам, предложениям и словам."""
+    return text_splitter.split_text(text)
 
 # Инициализируем морфологический анализатор для русского языка
 morph = pymorphy3.MorphAnalyzer()
@@ -166,8 +162,8 @@ async def upload_file(file: UploadFile = File(...)):
                 status_code=400, detail="Файл пуст или не содержит текста"
             )
 
-        # 2. Нарезаем текст на чанки по 500 символов с перекрытием 100
-        chunks = chunk_text(raw_text, chunk_size=500, overlap=100)
+        # 2. Используем рекурсивный чанкинг
+        chunks = chunk_text_recursively(raw_text)
 
         # 3. Генерируем уникальные ID и добавляем в ChromaDB
         existing_count = collection.count()
