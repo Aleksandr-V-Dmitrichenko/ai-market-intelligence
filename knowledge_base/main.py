@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import json
 import chromadb
 import pymorphy3
 from chromadb.utils import embedding_functions
@@ -16,7 +17,7 @@ from rank_bm25 import BM25Okapi
 # 1. Загружаем переменные окружения (.env)
 load_dotenv(find_dotenv())
 
-app = FastAPI(title="Production Hybrid RAG Microservice")
+app = FastAPI(title="Production Parent-Child Hybrid RAG Service")
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
@@ -37,12 +38,37 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=multilingual_ef,
 )
 
-# Настраиваем уманый рекусривный чанкер
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
+# ─── PARENT-CHILD ЧАНКЕРЫ ────────────────────────────────────────────────────────
+# 1. Родительский чанкер (крупный контекст для LLM)
+parent_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
     chunk_overlap=100,
     separators=["\n\n", "\n", ". ", " ", ""],
 )
+
+# 2. Дочерний чанкер (точный точечный поиск для векторов и BM25)
+child_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=200,
+    chunk_overlap=30,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
+# Хранилище родительских чанков key - value
+DOCSTORE_FILE = "./docstore.json"
+
+def load_docstore() -> dict:
+    if os.path.exists(DOCSTORE_FILE):
+        try:
+            with open(DOCSTORE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            # Если файл пуст или поврежден — безопасно возвращаем пустой словарь
+            return {}
+    return {}
+
+
+def save_docstore(data: dict):
+    with open(DOCSTORE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 # Вспомогательные функции для парсинга и чанкинга
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
@@ -74,64 +100,73 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     return text.strip()
 
 
-def chunk_text_recursively(text: str) -> list[str]:
-    """Умная каскадная нарезка текста по абзацам, предложениям и словам."""
-    return text_splitter.split_text(text)
-
 # Инициализируем морфологический анализатор для русского языка
 morph = pymorphy3.MorphAnalyzer()
 
-# Вспомогательные функции гибридного поиска
 def tokenize(text: str) -> list[str]:
-    # Удаляем все знаки препинания, оставляем только буквы и цифры
+    """Токенизация с защитой типов и лемматизацией."""
+    if isinstance(text, dict):
+        text = text.get("text", "")
+
+    if not isinstance(text, str):
+        text = str(text)
+
     clean_text = re.sub(r"[^\w\s]", " ", text.lower())
-    # Режем по пробелам и отбрасываем пустые токены
-    words = [word for word in clean_text.split() if len(word) > 1]
-    # Приводим КАЖДОЕ слово к его начальной словарной форме (лемме)
-    lemmatized_words = [morph.parse(w)[0].normal_form for w in words]
-    return lemmatized_words
+    words = [w for w in clean_text.split() if len(w) > 1]
+    return [morph.parse(w)[0].normal_form for w in words]
 
-def reciprocal_rank_fusion(
-    vector_docs: list[str], bm25_docs: list[str], k: int = 60, top_n: int = 4
+def reciprocal_rank_fusion_parent_child(
+    vector_child_metas: list[str], 
+    bm25_child_metas: list[str], 
+    k: int = 60, 
+    top_n: int = 3
 ) -> list[str]:
-    """
-    Алгоритм RRF: объединяет и переранжирует списки результатов от BM25 и Vector Search.
-    """
-    doc_scores = {}
-    # Начисляем очки за позицию в Векторном поиске
-    for rank, doc in enumerate(vector_docs):
-        if doc not in doc_scores:
-            doc_scores[doc] = 0.0
-        doc_scores[doc] += 1.0 / (k + rank + 1)
-
-    for rank, doc in enumerate(bm25_docs):
-        if doc not in doc_scores:
-            doc_scores[doc] = 0.0
-        doc_scores[doc] += 1.0 / (k + rank + 1)
-
-    # Сортируем документы по убыванию итогового RRF-балла
-    sorted_docs = sorted(
-        doc_scores.items(), key=lambda item:item[1], reverse=True
-    )
-    return [doc for doc, score in sorted_docs[:top_n]]
-
-def search_bm25(query: str, all_documents: list[str], top_k: int = 5) -> list[str]:
-    """Выполняет точный ключевой поиск BM25 по всему корпусу чанков."""
-    if not all_documents:
-        return []
+    """RRF, который группирует находки по parent_id и отбирает родительские чанки."""
+    parent_scores = {}
     
-    tokenized_corpus = [tokenize(doc) for doc in all_documents]
+    # Начисляем очки родителям на основе рангов векторного поиска
+    for rank, meta in enumerate(vector_child_metas):
+        pid = meta.get("parent_id")
+        if pid:
+            parent_scores[pid] = parent_scores.get(pid, 0.0) + (1.0 / (k + rank + 1))
+        
+    # Начисляем очки родителям на основе рангов BM25
+    for rank, meta in enumerate(bm25_child_metas):
+        pid = meta.get("parent_id")
+        if pid:
+            parent_scores[pid] = parent_scores.get(pid, 0.0) + (1.0 / (k + rank + 1))
+
+    # Сортируем родительские ID по итоговым баллам
+    sorted_parents = sorted(
+        parent_scores.items(), key=lambda item: item[1], reverse=True
+    )
+    top_parent_ids = [pid for pid, score in sorted_parents[:top_n]]
+
+    # Извлекаем тексты родителей из Docstore
+    docstore = load_docstore()
+    return [docstore[pid] for pid in top_parent_ids if pid in docstore]
+
+def search_bm25(
+    query: str, child_docs: list[dict], top_k: int = 25
+) -> list[dict]:
+    """Поиск по ключевым словам BM25 среди Дочерних чанков."""
+    if not child_docs:
+        return []
+
+    corpus_texts = [
+        doc["text"] if isinstance(doc, dict) else str(doc)
+        for doc in child_docs
+    ]
+    tokenized_corpus = [tokenize(t) for t in corpus_texts]
     bm25 = BM25Okapi(tokenized_corpus)
 
     tokenized_query = tokenize(query)
-    doc_scores = bm25.get_scores(tokenized_query)
+    scores = bm25.get_scores(tokenized_query)
 
     top_indices = sorted(
-        range(len(doc_scores)), key=lambda i: doc_scores[i], reverse=True
+        range(len(scores)), key=lambda i: scores[i], reverse=True
     )[:top_k]
-    return [
-        all_documents[i] for i in top_indices if doc_scores[i] > 0
-    ]
+    return [child_docs[i] for i in top_indices if scores[i] > 0]
 
 # Pydantic-схемы
 class QueryInput(BaseModel):
@@ -153,30 +188,55 @@ class QueryResponse(BaseModel):
 async def upload_file(file: UploadFile = File(...)):
     try:
         content = await file.read()
-
-        # 1. Извлекаем сырой текст из файла
         raw_text = extract_text_from_file(content, file.filename)
-        
         if not raw_text:
             raise HTTPException(
                 status_code=400, detail="Файл пуст или не содержит текста"
             )
 
-        # 2. Используем рекурсивный чанкинг
-        chunks = chunk_text_recursively(raw_text)
+        docstore = load_docstore()
 
-        # 3. Генерируем уникальные ID и добавляем в ChromaDB
-        existing_count = collection.count()
-        ids = [f"file_doc_{existing_count + i}" for i in range(len(chunks))]
+        # 1. Нарезаем на Родительские чанки (1000 симв)
+        parent_chunks = parent_splitter.split_text(raw_text)
 
-        collection.add(documents=chunks, ids=ids)
+        child_documents = []
+        child_metadatas = []
+        child_ids = []
+
+        child_counter = collection.count()
+
+        for p_idx, parent_text in enumerate(parent_chunks):
+            parent_id = f"parent_{file.filename}_{p_idx}_{len(docstore)}"
+            docstore[parent_id] = parent_text
+
+            # 2. Каждый родитель нарезаем на Дочерние чанки (200 симв)
+            child_chunks = child_splitter.split_text(parent_text)
+
+            for c_text in child_chunks:
+                child_id = f"child_{child_counter}"
+                child_counter += 1
+
+                child_documents.append(c_text)
+                child_metadatas.append({"parent_id": parent_id})
+                child_ids.append(child_id)
+
+        # Сохраняем родителей в KV-Docstore
+        save_docstore(docstore)
+
+        # Сохраняем детей в ChromaDB
+        if child_documents:
+            collection.add(
+                documents=child_documents,
+                metadatas=child_metadatas,
+                ids=child_ids,
+            )
 
         return {
             "status": "success",
             "filename": file.filename,
-            "extracted_text_length": len(raw_text),
-            "created_chunks_count": len(chunks),
-            "total_documents_in_db": collection.count(),
+            "created_parent_chunks": len(parent_chunks),
+            "created_child_chunks": len(child_documents),
+            "total_children_in_vector_db": collection.count(),
         }
 
     except ValueError as ve:
@@ -189,37 +249,41 @@ async def upload_file(file: UploadFile = File(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(data: QueryInput):
     try:
-        # 1. Достаем ВСЕ чанки из БД для BM25 (получаем полный корпус текстов)
-        db_data = collection.get()
-        all_documents = db_data.get("documents", []) if db_data else []
+        db_data = collection.get(include=["documents", "metadatas"])
+        all_child_docs = []
 
-        if not all_documents:
+        if db_data and db_data.get("documents"):
+            for text, meta in zip(db_data["documents"], db_data["metadatas"]):
+                all_child_docs.append({"text": text, "metadata": meta})
+
+        if not all_child_docs:
             return QueryResponse(
                 answer="База знаний пуста. Загрузите документы.",
                 found_context=[],
             )
 
-        # 2. Векторный поиск (Dense Search) — берутся Top-5 результатов
+        # 1. Векторный поиск по Child-чанкам (Top-25)
         vector_results = collection.query(
             query_texts=[data.question], n_results=25
         )
-        vector_docs = (
-            vector_results["documents"][0]
-            if vector_results.get("documents")
+        vector_child_metas = (
+            vector_results["metadatas"][0]
+            if vector_results.get("metadatas")
             else []
         )
-        # 3. Ключевой поиск BM25 (Sparse Search) — берутся Top-5 результатов
-        bm25_docs = search_bm25(data.question, all_documents, top_k=25)
+        # 2. BM25 поиск по Child-чанкам (Top-25)
+        bm25_child_results = search_bm25(data.question, all_child_docs, top_k=25)
+        bm25_child_metas = [item["metadata"] for item in bm25_child_results]
 
-        # 4. Объединение и слияние через RRF (берем Топ-4 итоговых чанка)
-        hybrid_docs = reciprocal_rank_fusion(
-            vector_docs, bm25_docs, k=60, top_n=5
+        # 3. RRF Слияние: ищем точных детей, а вытягиваем их РОДИТЕЛЕЙ (Top-3)
+        parent_contexts = reciprocal_rank_fusion_parent_child(
+            vector_child_metas, bm25_child_metas, k=60, top_n=3
         )
 
-        # 5. Склеиваем контекст
+        # 4. Склеиваем контекст
         context_str = (
-            "\n---\n".join(hybrid_docs)
-            if hybrid_docs
+            "\n---\n".join(parent_contexts)
+            if parent_contexts
             else "Контекст отсутствует."
         )
 
@@ -246,7 +310,7 @@ async def query_knowledge_base(data: QueryInput):
 
         return QueryResponse(
             answer=response.choices[0].message.content,
-            found_context=hybrid_docs,
+            found_context=parent_contexts,
         )
 
     except Exception as e:
