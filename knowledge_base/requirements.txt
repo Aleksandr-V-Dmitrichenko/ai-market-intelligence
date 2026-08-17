@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+fastapi
+uvicorn
+pydantic
+python-multipart
+chromadb
+sentence-transformers
+pymorphy3
+rank-bm25
+pypdf
+python-docx
+langchain-text-splitters
+mistralai>=1.0.0,<2.0.0
+python-dotenv

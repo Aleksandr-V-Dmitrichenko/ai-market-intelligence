@@ -1,0 +1,15 @@
+
+services:
+  rag_service:
+    build: .
+    container_name: fast_rag_app
+    ports:
+      - "8000:8000"
+    environment:
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      # Защита данных: связываем файлы на жестком диске с папкой /app внутри контейнера
+      - ./chroma_db:/app/chroma_db
+      - ./docstore.json:/app/docstore.json
+    restart: unless-stopped

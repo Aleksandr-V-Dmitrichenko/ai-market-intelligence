@@ -1,0 +1,7 @@
+.venv
+__pycache__/
+*.pyc
+.git
+.env
+chroma_db
+docstore.json
