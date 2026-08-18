@@ -1,7 +1,9 @@
-import io
 import os
+import io
 import re
 import json
+import csv
+from io import StringIO
 import chromadb
 import pymorphy3
 from chromadb.utils import embedding_functions
@@ -91,6 +93,7 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
 
     elif ext == "txt":
         text = file_bytes.decode("utf-8", errors="ignore")
+        
 
     else:
         raise ValueError(
@@ -98,6 +101,29 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
         )
 
     return text.strip()
+
+def process_csv_content(content_bytes: bytes, filename: str) -> list[str]:
+    # Декодируем байты в строку
+    text_content = content_bytes.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(StringIO(text_content))
+
+    parent_chunks = []
+
+    for row_idx, row in enumerate(reader, start=1):
+        # Очищаем ячейки от None, пустых строк и пробелов
+        clean_row = {k.strip(): v.strip() for k, v in row.items() if k and v and v.strip()}
+
+        if not clean_row:
+            continue
+
+        # Формируем семантическую строку "Колонка: Значение"
+        row_str = " | ".join([f"{k}: {v}" for k, v in clean_row.items()])
+        full_chunk = f"[Источник: {filename} | Строка {row_idx}] {row_str}"
+
+        parent_chunks.append(full_chunk)
+
+    return parent_chunks
+
 
 
 # Инициализируем морфологический анализатор для русского языка
@@ -183,22 +209,29 @@ class QueryResponse(BaseModel):
     )
 
 
-# Эндпоинт 1: Загрузка файлов (PDF, DOCX, TXT)
+# Эндпоинт 1: Загрузка файлов (PDF, DOCX, TXT, CSV)
 @app.post("/upload_file")
 async def upload_file(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        raw_text = extract_text_from_file(content, file.filename)
-        if not raw_text:
-            raise HTTPException(
-                status_code=400, detail="Файл пуст или не содержит текста"
-            )
+        ext = file.filename.split(".")[-1].lower()
+
+        # Если CSV — сразу получаем готовые родительские чанки без повторной нарезки
+        if ext == "csv":
+            parent_chunks = process_csv_content(content, file.filename)
+            if not parent_chunks:
+                raise HTTPException(status_code=400, detail="CSV файл пуст или содержит только пустые строки")
+
+        else: 
+            raw_text = extract_text_from_file(content, file.filename)
+            if not raw_text:
+                raise HTTPException(
+                    status_code=400, detail="Файл пуст или не содержит текста"
+                )
+
+            parent_chunks = parent_splitter.split_text(raw_text)
 
         docstore = load_docstore()
-
-        # 1. Нарезаем на Родительские чанки (1000 симв)
-        parent_chunks = parent_splitter.split_text(raw_text)
-
         child_documents = []
         child_metadatas = []
         child_ids = []
