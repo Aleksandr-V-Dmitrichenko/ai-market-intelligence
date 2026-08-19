@@ -1,13 +1,17 @@
 import os
 import pytest
+from fastapi.testclient import TestClient
 from main import (
+    app,
+    tasks_db,
     tokenize,
     parent_splitter,
     child_splitter,
     reciprocal_rank_fusion_parent_child,
 )
 
-# ─── 1. ТЕСТ ТОКЕНИЗАЦИИ И ЛЕММАТИЗАЦИИ ───────────────────────────────────────
+client = TestClient(app)
+
 def test_tokenize_lemmatization():
     raw_text = "Компания выплачивает ЕЖЕМЕСЯЧНЫЕ премии сотрудникам!"
     tokens = tokenize(raw_text)
@@ -20,7 +24,6 @@ def test_tokenize_lemmatization():
     assert "сотрудник" in tokens
 
 
-# ─── 2. ТЕСТ PARENT-CHILD ЧАНКИНГА ───────────────────────────────────────────
 def test_parent_child_chunking():
     # Создаем тестовый текст длиннее родительского порога (>1000 символов)
     paragraph = "Каждый сотрудник имеет право на ежегодный оплачиваемый отпуск. "
@@ -37,7 +40,6 @@ def test_parent_child_chunking():
     assert len(child_chunks[0]) <= 250
 
 
-# ─── 3. ТЕСТ АЛГОРИТМА RRF (Reciprocal Rank Fusion) ──────────────────────────
 def test_rrf_parent_child_fusion(monkeypatch):
     # Мокаем (подменяем) функцию загрузки docstore, чтобы не читать реальный диск
     mock_docstore = {
@@ -64,3 +66,41 @@ def test_rrf_parent_child_fusion(monkeypatch):
 
     assert len(top_parents) == 2
     assert top_parents[0] == mock_docstore["parent_2"]  # Победитель RRF
+
+def test_upload_file_async_and_task_polling():
+    """Тест фоновой загрузки файла и проверки статуса через /tasks/{task_id}."""
+    # 1. Готовим фейковый CSV-файл в памяти
+    csv_content = "Title,Price\nБрус обрезной,1500\nДоска сухая,800"
+    files = {
+        "file": (
+            "test_async.csv",
+            csv_content.encode("utf-8"),
+            "text/csv",
+        )
+    }
+
+    # 2. Отправляем запрос на загрузку
+    response = client.post("/upload_file", files=files)
+
+    # Проверяем мгновенный ответ 202 Accepted
+    assert response.status_code == 202
+    data = response.json()
+    assert data["status"] == "accepted"
+    assert "task_id" in data
+
+    task_id = data["task_id"]
+
+    # 3. Проверяем статус задачи через GET /tasks/{task_id}
+    task_response = client.get(f"/tasks/{task_id}")
+    assert task_response.status_code == 200
+
+    task_data = task_response.json()
+    assert task_data["status"] == "completed"
+    assert task_data["created_parent_chunks"] == 2
+
+
+def test_get_non_existent_task():
+    """Тест обращения к несуществующей фоновой задаче."""
+    response = client.get("/tasks/task_does_not_exist_999")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Задача не найдена"
