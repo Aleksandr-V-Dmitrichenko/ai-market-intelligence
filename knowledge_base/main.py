@@ -9,7 +9,7 @@ import pymorphy3
 from chromadb.utils import embedding_functions
 from dotenv import find_dotenv, load_dotenv
 from docx import Document as DocxDocument
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks
 from mistralai import Mistral
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
@@ -124,6 +124,66 @@ def process_csv_content(content_bytes: bytes, filename: str) -> list[str]:
 
     return parent_chunks
 
+# Глобальный реестр статусов фоновых задач
+tasks_db = {}
+
+
+def process_file_in_background(task_id: str, content: bytes, filename: str):
+    """Тяжелая функция векторизации, выполняемая в фоновом потоке."""
+    try:
+        tasks_db[task_id] = {"status": "processing", "filename": filename}
+
+        ext = filename.split(".")[-1].lower()
+
+        # 1. Извлекаем и нарезаем родительские чанки
+        if ext == "csv":
+            parent_chunks = process_csv_content(content, filename)
+        else:
+            raw_text = extract_text_from_file(content, filename)
+            parent_chunks = parent_splitter.split_text(raw_text)
+
+        docstore = load_docstore()
+        child_documents = []
+        child_metadatas = []
+        child_ids = []
+
+        child_counter = collection.count()
+
+        # 2. Формируем дочерние чанки
+        initial_docstore_len = len(docstore)
+        for p_idx, parent_text in enumerate(parent_chunks):
+            parent_id = f"parent_{filename}_{p_idx}_{initial_docstore_len}"
+            docstore[parent_id] = parent_text
+
+            child_chunks = child_splitter.split_text(parent_text)
+
+            for c_text in child_chunks:
+                child_id = f"child_{child_counter}"
+                child_counter += 1
+                child_documents.append(c_text)
+                child_metadatas.append({"parent_id": parent_id})
+                child_ids.append(child_id)
+
+        # 3. Сохраняем в KV-Docstore и ChromaDB
+        save_docstore(docstore)
+        if child_documents:
+            collection.add(
+                documents=child_documents,
+                metadatas=child_metadatas,
+                ids=child_ids,
+            )
+
+        # 4. Обновляем финальный статус задачи
+        tasks_db[task_id] = {
+            "status": "completed",
+            "filename": filename,
+            "created_parent_chunks": len(parent_chunks),
+            "created_child_chunks": len(child_documents),
+            "total_children_in_vector_db": collection.count(),
+        }
+
+    except Exception as e:
+        tasks_db[task_id] = {"status": "failed", "error": str(e)}
 
 
 # Инициализируем морфологический анализатор для русского языка
@@ -142,8 +202,8 @@ def tokenize(text: str) -> list[str]:
     return [morph.parse(w)[0].normal_form for w in words]
 
 def reciprocal_rank_fusion_parent_child(
-    vector_child_metas: list[str], 
-    bm25_child_metas: list[str], 
+    vector_child_metas: list[dict], 
+    bm25_child_metas: list[dict], 
     k: int = 60, 
     top_n: int = 3
 ) -> list[str]:
@@ -210,73 +270,45 @@ class QueryResponse(BaseModel):
 
 
 # Эндпоинт 1: Загрузка файлов (PDF, DOCX, TXT, CSV)
-@app.post("/upload_file")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        ext = file.filename.split(".")[-1].lower()
+@app.post("/upload_file", status_code=202)
+async def upload_file(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
+    content = await file.read()
+    ext = file.filename.split(".")[-1].lower()
 
-        # Если CSV — сразу получаем готовые родительские чанки без повторной нарезки
-        if ext == "csv":
-            parent_chunks = process_csv_content(content, file.filename)
-            if not parent_chunks:
-                raise HTTPException(status_code=400, detail="CSV файл пуст или содержит только пустые строки")
+    if ext not in ["pdf", "docx", "doc", "txt", "csv"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неподдерживаемый формат файла: {ext}.",
+        )
 
-        else: 
-            raw_text = extract_text_from_file(content, file.filename)
-            if not raw_text:
-                raise HTTPException(
-                    status_code=400, detail="Файл пуст или не содержит текста"
-                )
+    # Генерируем уникальный ID задачи
+    task_id = f"task_{file.filename}_{len(tasks_db) + 1}"
 
-            parent_chunks = parent_splitter.split_text(raw_text)
+    # Ставим задачу в фоновую очередь FastAPI
+    background_tasks.add_task(
+        process_file_in_background,
+        task_id=task_id,
+        content=content,
+        filename=file.filename,
+    )
 
-        docstore = load_docstore()
-        child_documents = []
-        child_metadatas = []
-        child_ids = []
+    # Возвращаем мгновенный ответ со статусом HTTP 202 Accepted
+    return {
+        "status": "accepted",
+        "task_id": task_id,
+        "message": "Файл принят на обработку. Проверяйте статус через GET /tasks/{task_id}",
+    }
 
-        child_counter = collection.count()
 
-        for p_idx, parent_text in enumerate(parent_chunks):
-            parent_id = f"parent_{file.filename}_{p_idx}_{len(docstore)}"
-            docstore[parent_id] = parent_text
-
-            # 2. Каждый родитель нарезаем на Дочерние чанки (200 симв)
-            child_chunks = child_splitter.split_text(parent_text)
-
-            for c_text in child_chunks:
-                child_id = f"child_{child_counter}"
-                child_counter += 1
-
-                child_documents.append(c_text)
-                child_metadatas.append({"parent_id": parent_id})
-                child_ids.append(child_id)
-
-        # Сохраняем родителей в KV-Docstore
-        save_docstore(docstore)
-
-        # Сохраняем детей в ChromaDB
-        if child_documents:
-            collection.add(
-                documents=child_documents,
-                metadatas=child_metadatas,
-                ids=child_ids,
-            )
-
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "created_parent_chunks": len(parent_chunks),
-            "created_child_chunks": len(child_documents),
-            "total_children_in_vector_db": collection.count(),
-        }
-
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+@app.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    """Эндпоинт для polling-проверки статуса индексации."""
+    task = tasks_db.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return task
 
 # Эндпоинт 2: Вопрос к базе знаний
 @app.post("/query", response_model=QueryResponse)
